@@ -32,6 +32,7 @@ class AnalyzeResponse(BaseModel):
     memo: str
 
 
+# Default department keywords (used for semantic mapping)
 DEPARTMENT_KEYWORDS = {
     "Compliance": [
         r"compliance", r"policy", r"governance", r"reporting", r"regulatory filing",
@@ -70,6 +71,8 @@ DEPARTMENT_KEYWORDS = {
     ],
 }
 
+DEFAULT_DEPARTMENTS = list(DEPARTMENT_KEYWORDS.keys())
+
 REGULATOR_PATTERNS = [
     r"(financial conduct authority|fca)",
     r"(monetary authority of singapore|mas)",
@@ -87,9 +90,9 @@ REGULATOR_PATTERNS = [
 ]
 
 REFERENCE_PATTERNS = [
-    r"\b(Circular|Notice|Advisory|Guideline|Directive)\s*(No\.?|Number|Ref\.?|Reference)?\s*[:#-]?\s*([A-Za-z0-9\-\/_.]+)",
-    r"\bRef(?:erence)?\s*(No\.|Number)?\s*[:#-]?\s*([A-Za-z0-9\-\/_.]+)",
-    r"\bNo\.?\s*[:#-]?\s*([A-Za-z0-9\-\/_.]+)",
+    r"\b(Circular|Notice|Advisory|Guideline|Directive)\s*(No\.?|Number|Ref\.?|Reference)?\s*[:#-]?\s*([A-Za-z0-9\-\/_ .]+)",
+    r"\bRef(?:erence)?\s*(No\.|Number)?\s*[:#-]?\s*([A-Za-z0-9\-\/_ .]+)",
+    r"\bNo\.?\s*[:#-]?\s*([A-Za-z0-9\-\/_ .]+)",
 ]
 
 DATE_PATTERNS = [
@@ -98,6 +101,85 @@ DATE_PATTERNS = [
     r"\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b",
 ]
 
+# --- Department storage helpers (DB if available, else in-memory fallback) ---
+_configured_departments: Optional[List[str]] = None
+
+def _db_available():
+    try:
+        from database import db  # type: ignore
+        return db is not None
+    except Exception:
+        return False
+
+
+def get_configured_departments() -> List[str]:
+    global _configured_departments
+    # Try DB-backed configuration first
+    try:
+        from database import db  # type: ignore
+        if db is not None:
+            names = [d.get("name") for d in db["department"].find({}, {"name": 1, "_id": 0})]
+            names = [n for n in names if isinstance(n, str) and n.strip()]
+            if not names:
+                # seed defaults
+                for n in DEFAULT_DEPARTMENTS:
+                    db["department"].update_one({"name": n}, {"$set": {"name": n}}, upsert=True)
+                names = DEFAULT_DEPARTMENTS.copy()
+            return names
+    except Exception:
+        pass
+
+    # Fallback to in-memory during this process (session persistence only)
+    if _configured_departments is None:
+        _configured_departments = DEFAULT_DEPARTMENTS.copy()
+    return _configured_departments
+
+
+def add_department(name: str) -> List[str]:
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Department name is required")
+
+    try:
+        from database import db  # type: ignore
+        if db is not None:
+            exists = db["department"].find_one({"name": name})
+            if not exists:
+                db["department"].insert_one({"name": name, "created_at": datetime.utcnow()})
+            return get_configured_departments()
+    except Exception:
+        pass
+
+    # fallback in-memory
+    global _configured_departments
+    if _configured_departments is None:
+        _configured_departments = DEFAULT_DEPARTMENTS.copy()
+    if name not in _configured_departments:
+        _configured_departments.append(name)
+    return _configured_departments
+
+
+def delete_department(name: str) -> List[str]:
+    name = (name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Department name is required")
+
+    try:
+        from database import db  # type: ignore
+        if db is not None:
+            db["department"].delete_many({"name": name})
+            return get_configured_departments()
+    except Exception:
+        pass
+
+    global _configured_departments
+    if _configured_departments is None:
+        _configured_departments = DEFAULT_DEPARTMENTS.copy()
+    _configured_departments = [d for d in _configured_departments if d != name]
+    return _configured_departments
+
+
+# --- Extractors ---
 
 def extract_first(text: str, patterns: List[str], flags=re.IGNORECASE) -> Optional[str]:
     for pat in patterns:
@@ -148,17 +230,32 @@ def extract_date(text: str) -> Optional[str]:
     return None
 
 
-def detect_departments(text: str) -> List[str]:
-    found = []
-    for dept, patterns in DEPARTMENT_KEYWORDS.items():
-        for pat in patterns:
+# --- Department detection using configured list ---
+
+def _name_token_patterns(name: str) -> List[str]:
+    tokens = re.split(r"[^A-Za-z0-9]+", name.lower())
+    tokens = [t for t in tokens if len(t) > 2]
+    if not tokens:
+        return []
+    return [rf"\b{re.escape(t)}\b" for t in tokens]
+
+
+def detect_departments(text: str, choose_from: Optional[List[str]] = None) -> List[str]:
+    choose_from = choose_from or get_configured_departments()
+    found: List[str] = []
+    for dept in choose_from:
+        pats = DEPARTMENT_KEYWORDS.get(dept, None)
+        if not pats:
+            pats = _name_token_patterns(dept)
+        for pat in pats:
             if re.search(pat, text, re.IGNORECASE):
                 found.append(dept)
                 break
-    if not found:
+    if not found and "Compliance" in choose_from:
         found = ["Compliance"]
+    # Unique preserve order
     seen = set()
-    ordered = []
+    ordered: List[str] = []
     for d in found:
         if d not in seen:
             ordered.append(d)
@@ -283,7 +380,8 @@ def run_analysis(text: str) -> AnalyzeResponse:
     regulator = extract_regulator(text)
     reference = extract_reference(text)
     date = extract_date(text)
-    departments = detect_departments(text)
+    dept_list = get_configured_departments()
+    departments = detect_departments(text, dept_list)
     title = generate_title(text, regulator, reference)
     bullets = make_summary(text, regulator, reference, date)
     memo = format_memo(title, regulator, reference, date, departments, bullets)
@@ -353,6 +451,26 @@ async def analyze_file(file: UploadFile = File(...)) -> AnalyzeResponse:
         return run_analysis(text_content)
     finally:
         await file.close()
+
+
+# --- Settings Endpoints ---
+class DepartmentIn(BaseModel):
+    name: str
+
+
+@app.get("/settings/departments", response_model=List[str])
+def list_departments() -> List[str]:
+    return get_configured_departments()
+
+
+@app.post("/settings/departments", response_model=List[str])
+def create_department(dep: DepartmentIn) -> List[str]:
+    return add_department(dep.name)
+
+
+@app.delete("/settings/departments/{name}", response_model=List[str])
+def remove_department(name: str) -> List[str]:
+    return delete_department(name)
 
 
 @app.get("/")
