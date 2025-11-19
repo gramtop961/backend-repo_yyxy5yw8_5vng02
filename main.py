@@ -3,7 +3,7 @@ import re
 from datetime import datetime
 from typing import List, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -103,7 +103,6 @@ def extract_first(text: str, patterns: List[str], flags=re.IGNORECASE) -> Option
     for pat in patterns:
         m = re.search(pat, text, flags)
         if m:
-            # Return the most descriptive group
             return m.group(0)
     return None
 
@@ -112,7 +111,6 @@ def extract_regulator(text: str) -> Optional[str]:
     reg = extract_first(text, REGULATOR_PATTERNS)
     if reg:
         return reg.strip().rstrip(':.')
-    # Heuristic: look for "by the <Name>" or "from the <Name>"
     m = re.search(r"(?:by|from) the ([A-Z][A-Za-z &(\)]+?)(?:,|\.|\n)", text)
     if m:
         return m.group(1)
@@ -123,7 +121,6 @@ def extract_reference(text: str) -> Optional[str]:
     for pat in REFERENCE_PATTERNS:
         m = re.search(pat, text, re.IGNORECASE)
         if m:
-            # Try the last group if exists, otherwise the whole match
             val = m.group(len(m.groups())) if m.groups() else m.group(0)
             return val.strip().rstrip('.')
     return None
@@ -135,15 +132,12 @@ def extract_date(text: str) -> Optional[str]:
         if m:
             try:
                 if len(m.groups()) == 3 and m.group(2).isalpha():
-                    # e.g., 12 March 2024
                     day, month, year = int(m.group(1)), m.group(2), int(m.group(3))
                     dt = datetime.strptime(f"{day} {month} {year}", "%d %B %Y")
                 elif pat.startswith("\\b(\\d{4})-"):
-                    # YYYY-MM-DD
                     year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
                     dt = datetime(year, month, day)
                 else:
-                    # DD/MM/YYYY or similar
                     day, month, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
                     if year < 100:
                         year += 2000
@@ -161,10 +155,8 @@ def detect_departments(text: str) -> List[str]:
             if re.search(pat, text, re.IGNORECASE):
                 found.append(dept)
                 break
-    # Ensure at least one sensible default if none found
     if not found:
         found = ["Compliance"]
-    # Deduplicate preserving order
     seen = set()
     ordered = []
     for d in found:
@@ -180,7 +172,6 @@ def generate_title(text: str, regulator: Optional[str], reference: Optional[str]
     if reference:
         return f"Circular {reference}"
     if regulator:
-        # Try to infer theme
         theme = None
         themes = {
             "KYC/AML": r"kyc|aml|sanction|cft|pep|beneficial",
@@ -192,7 +183,6 @@ def generate_title(text: str, regulator: Optional[str], reference: Optional[str]
                 theme = k
                 break
         return f"{regulator}: {theme or 'Regulatory Update'}"
-    # Fallback: first sentence trimmed
     first_line = re.split(r"[\n\.]", text.strip())
     if first_line and first_line[0]:
         base = first_line[0]
@@ -210,10 +200,8 @@ def make_summary(text: str, regulator: Optional[str], reference: Optional[str], 
     if date:
         bullets.append(f"Date: {date}")
 
-    # Extract 3-7 salient sentences heuristically
     sentences = re.split(r"(?<=[\.!?])\s+", text.strip())
     sentences = [s.strip() for s in sentences if len(s.strip()) > 0]
-    # Prefer sentences that contain action words
     ranked = sorted(
         sentences,
         key=lambda s: (
@@ -229,7 +217,6 @@ def make_summary(text: str, regulator: Optional[str], reference: Optional[str], 
         if len(bullets) >= 10:
             break
 
-    # Ensure 5–10 bullets
     while len(bullets) < 5:
         bullets.append("This circular introduces requirements and expectations for the institution.")
 
@@ -287,10 +274,10 @@ def format_memo(title: str, regulator: Optional[str], reference: Optional[str], 
     return "\n\n".join([p for p in parts if p.strip()])
 
 
-@app.post("/analyze", response_model=AnalyzeResponse)
-def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
-    text = req.text or ""
-    # Basic normalization for robustness on long inputs
+# internal helper so we can reuse for text or file uploads
+
+def run_analysis(text: str) -> AnalyzeResponse:
+    text = text or ""
     text = re.sub(r"\x00", " ", text)
 
     regulator = extract_regulator(text)
@@ -310,6 +297,62 @@ def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
         summary_bullets=bullets,
         memo=memo,
     )
+
+
+@app.post("/analyze", response_model=AnalyzeResponse)
+def analyze(req: AnalyzeRequest) -> AnalyzeResponse:
+    return run_analysis(req.text)
+
+
+@app.post("/analyze-file", response_model=AnalyzeResponse)
+async def analyze_file(file: UploadFile = File(...)) -> AnalyzeResponse:
+    # Validate basic content types
+    ct = file.content_type or ""
+    name = file.filename or "uploaded"
+    ext = os.path.splitext(name)[1].lower()
+
+    try:
+        raw = await file.read()
+        if len(raw) == 0:
+            raise HTTPException(status_code=400, detail="Empty file uploaded")
+
+        text_content = None
+        if ext == ".pdf" or ct in {"application/pdf"}:
+            try:
+                from PyPDF2 import PdfReader
+                import io
+                reader = PdfReader(io.BytesIO(raw))
+                pieces = []
+                for page in reader.pages:
+                    pieces.append(page.extract_text() or "")
+                text_content = "\n".join(pieces)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Failed to read PDF: {str(e)[:120]}")
+        elif ext == ".docx" or ct in {"application/vnd.openxmlformats-officedocument.wordprocessingml.document"}:
+            try:
+                from docx import Document
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".docx", delete=True) as tmp:
+                    tmp.write(raw)
+                    tmp.flush()
+                    doc = Document(tmp.name)
+                text_content = "\n".join(p.text for p in doc.paragraphs)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Failed to read DOCX: {str(e)[:120]}")
+        else:
+            # Fallback: try to decode as text
+            try:
+                text_content = raw.decode("utf-8", errors="ignore")
+            except Exception:
+                raise HTTPException(status_code=415, detail="Unsupported file type. Please upload PDF or DOCX.")
+
+        text_content = (text_content or "").strip()
+        if not text_content:
+            raise HTTPException(status_code=400, detail="No text could be extracted from the file.")
+
+        return run_analysis(text_content)
+    finally:
+        await file.close()
 
 
 @app.get("/")
