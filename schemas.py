@@ -12,7 +12,7 @@ Model name is converted to lowercase for the collection name:
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List, Literal
 
 # Example schemas (replace with your own):
 
@@ -38,8 +38,36 @@ class Product(BaseModel):
     category: str = Field(..., description="Product category")
     in_stock: bool = Field(True, description="Whether product is in stock")
 
-# Add your own schemas here:
 # --------------------------------------------------
+# Regulatory Circular Register Schemas (used by app)
+# --------------------------------------------------
+
+class Circular(BaseModel):
+    """
+    Register of analyzed regulatory circulars
+    Collection name: "circular"
+    """
+    title: str = Field(..., description="Generated title for the circular")
+    regulator: Optional[str] = Field(None, description="Identified regulator")
+    reference: Optional[str] = Field(None, description="Circular number or reference")
+    date: Optional[str] = Field(None, description="Date string in human readable form")
+    departments: List[str] = Field(default_factory=list, description="Detected target departments")
+    summary_bullets: List[str] = Field(default_factory=list, description="Key points summary")
+    memo: str = Field(..., description="Formatted internal memo text")
+    raw_text: str = Field(..., description="Original circular text content")
+    status: Literal["open", "in_progress", "closed"] = Field("open", description="Lifecycle status for the circular")
+    tags: Optional[List[str]] = Field(default=None, description="Optional tags/labels")
+
+class CircularAssignment(BaseModel):
+    """
+    Per-department tracking for each circular
+    Collection name: "circularassignment"
+    """
+    circular_id: str = Field(..., description="Associated circular document id (string)")
+    department: str = Field(..., description="Department name")
+    is_binding: bool = Field(True, description="Whether the circular is binding for this department")
+    status: Literal["pending", "in_progress", "compliant", "non_compliant"] = Field("pending", description="Compliance status for this department")
+    notes: Optional[str] = Field(None, description="Optional notes or comments")
 
 # Note: The Flames database viewer will automatically:
 # 1. Read these schemas from GET /schema endpoint

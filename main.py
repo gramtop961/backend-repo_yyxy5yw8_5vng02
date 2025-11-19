@@ -1,7 +1,7 @@
 import os
 import re
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Literal, Dict, Any
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +30,15 @@ class AnalyzeResponse(BaseModel):
     departments: List[str]
     summary_bullets: List[str]
     memo: str
+    circular_id: Optional[str] = Field(None, description="Database id of the saved circular")
+
+
+class AssignmentUpdate(BaseModel):
+    circular_id: str
+    department: str
+    is_binding: Optional[bool] = None
+    status: Optional[Literal["pending", "in_progress", "compliant", "non_compliant"]] = None
+    notes: Optional[str] = None
 
 
 # Default department keywords (used for semantic mapping)
@@ -103,6 +112,7 @@ DATE_PATTERNS = [
 
 # --- Department storage helpers (DB if available, else in-memory fallback) ---
 _configured_departments: Optional[List[str]] = None
+
 
 def _db_available():
     try:
@@ -371,6 +381,44 @@ def format_memo(title: str, regulator: Optional[str], reference: Optional[str], 
     return "\n\n".join([p for p in parts if p.strip()])
 
 
+# --- Persistence helpers ---
+
+def save_circular_to_db(analysis: AnalyzeResponse, raw_text: str) -> Optional[str]:
+    """Save circular to register and seed department assignments."""
+    try:
+        from database import create_document, db
+        if db is None:
+            return None
+
+        circular_doc: Dict[str, Any] = {
+            "title": analysis.title,
+            "regulator": analysis.regulator,
+            "reference": analysis.reference,
+            "date": analysis.date,
+            "departments": analysis.departments,
+            "summary_bullets": analysis.summary_bullets,
+            "memo": analysis.memo,
+            "raw_text": raw_text,
+            "status": "open",
+            "tags": [],
+        }
+        circular_id = create_document("circular", circular_doc)
+        # Create per-department assignment docs (default binding & pending)
+        for d in analysis.departments:
+            db["circularassignment"].insert_one({
+                "circular_id": circular_id,
+                "department": d,
+                "is_binding": True,
+                "status": "pending",
+                "notes": None,
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            })
+        return circular_id
+    except Exception:
+        return None
+
+
 # internal helper so we can reuse for text or file uploads
 
 def run_analysis(text: str) -> AnalyzeResponse:
@@ -386,7 +434,7 @@ def run_analysis(text: str) -> AnalyzeResponse:
     bullets = make_summary(text, regulator, reference, date)
     memo = format_memo(title, regulator, reference, date, departments, bullets)
 
-    return AnalyzeResponse(
+    analysis = AnalyzeResponse(
         title=title,
         regulator=regulator,
         reference=reference,
@@ -395,6 +443,13 @@ def run_analysis(text: str) -> AnalyzeResponse:
         summary_bullets=bullets,
         memo=memo,
     )
+
+    # Persist to register (if DB configured)
+    cid = save_circular_to_db(analysis, text)
+    if cid:
+        analysis.circular_id = cid
+
+    return analysis
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
@@ -471,6 +526,78 @@ def create_department(dep: DepartmentIn) -> List[str]:
 @app.delete("/settings/departments/{name}", response_model=List[str])
 def remove_department(name: str) -> List[str]:
     return delete_department(name)
+
+
+# --- Register & History Endpoints ---
+@app.get("/history")
+def list_history() -> List[Dict[str, Any]]:
+    """List saved circulars for history/register page."""
+    try:
+        from database import db
+        if db is None:
+            return []
+        items = []
+        for d in db["circular"].find({}, {"title": 1, "departments": 1, "created_at": 1} ).sort("created_at", -1).limit(100):
+            # created_at added by helper at insert time
+            items.append({
+                "id": str(d.get("_id")),
+                "title": d.get("title"),
+                "departments": d.get("departments", []),
+                "created_at": d.get("created_at"),
+            })
+        return items
+    except Exception:
+        return []
+
+
+@app.get("/history/{circular_id}")
+def get_history_detail(circular_id: str) -> Dict[str, Any]:
+    try:
+        from database import db
+        from bson import ObjectId
+        if db is None:
+            raise HTTPException(status_code=503, detail="Database not available")
+        doc = db["circular"].find_one({"_id": ObjectId(circular_id)})
+        if not doc:
+            raise HTTPException(status_code=404, detail="Circular not found")
+        assignments = list(db["circularassignment"].find({"circular_id": str(doc.get("_id"))}))
+        # Serialize
+        detail = {k: v for k, v in doc.items() if k != "_id"}
+        detail["id"] = str(doc.get("_id"))
+        for a in assignments:
+            a["id"] = str(a.get("_id"))
+            a.pop("_id", None)
+        detail["assignments"] = assignments
+        return detail
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
+
+
+@app.post("/assignments/update")
+def update_assignment(payload: AssignmentUpdate) -> Dict[str, Any]:
+    """Update binding flag or compliance status/notes for a department assignment."""
+    try:
+        from database import db
+        if db is None:
+            raise HTTPException(status_code=503, detail="Database not available")
+        # find assignment by circular_id + department
+        q = {"circular_id": payload.circular_id, "department": payload.department}
+        update: Dict[str, Any] = {"updated_at": datetime.utcnow()}
+        if payload.is_binding is not None:
+            update["is_binding"] = bool(payload.is_binding)
+        if payload.status is not None:
+            update["status"] = payload.status
+        if payload.notes is not None:
+            update["notes"] = payload.notes
+        res = db["circularassignment"].update_one(q, {"$set": update}, upsert=True)
+        ok = res.matched_count > 0 or res.upserted_id is not None
+        return {"ok": ok}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:120])
 
 
 @app.get("/")
